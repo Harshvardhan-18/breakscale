@@ -54,6 +54,21 @@ const DEFAULT_COOLDOWN_MS = 5000;
 const DEFAULT_STEP_PCT = 0.5;
 const DEFAULT_WARMUP_MS = 0;
 
+/**
+ * One optional knob, or its fallback.
+ *
+ * `??` delivers the promise above for an UNSET field and not for one set to
+ * something that is not a number, and none of these knobs is among the nine
+ * config numbers `isTopology` checks -- so a shared link, a `.breakscale`
+ * file and a restored session can all hand the controller a NaN. NaN then
+ * survives `Math.floor`, `Math.max` and `clamp01` alike, because it fails
+ * every comparison those are written from, and the controller stops
+ * controlling.
+ */
+function knob(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) ? (value as number) : fallback;
+}
+
 interface AutoscalerState {
   /** Simulated time of the last decision; -Infinity means "never decided". */
   lastDecisionMs: number;
@@ -185,7 +200,7 @@ const autoscaler: ComponentBehaviour = {
       // ...and starts a fresh observation window, because the new node's
       // smoothed utilisation is not a signal yet.
       st.observeUntilMs =
-        ctx.now + Math.max(0, state.config.cooldownMs ?? DEFAULT_COOLDOWN_MS);
+        ctx.now + Math.max(0, knob(state.config.cooldownMs, DEFAULT_COOLDOWN_MS));
     }
     if (watched === '') return;
 
@@ -218,7 +233,7 @@ const autoscaler: ComponentBehaviour = {
     if (st.warmupDueMs >= 0) return;
 
     const cfg = state.config;
-    const cooldown = Math.max(0, cfg.cooldownMs ?? DEFAULT_COOLDOWN_MS);
+    const cooldown = Math.max(0, knob(cfg.cooldownMs, DEFAULT_COOLDOWN_MS));
 
     // Hold off until the watched node's utilisation is a real measurement
     // rather than an average still climbing out of its initial zero.
@@ -241,13 +256,16 @@ const autoscaler: ComponentBehaviour = {
     // the unit they bound is now INSTANCES -- the fleet size, not the thread
     // count. For every topology written before instances existed the two
     // readings coincide, because those nodes run exactly one instance.
-    const minInst = Math.max(1, Math.floor(cfg.minCapacity ?? DEFAULT_MIN_INSTANCES));
+    const minInst = Math.max(
+      1,
+      Math.floor(knob(cfg.minCapacity, DEFAULT_MIN_INSTANCES)),
+    );
     const maxInst = Math.max(
       minInst,
-      Math.floor(cfg.maxCapacity ?? DEFAULT_MAX_INSTANCES),
+      Math.floor(knob(cfg.maxCapacity, DEFAULT_MAX_INSTANCES)),
     );
-    const target = clamp01(cfg.targetUtil ?? DEFAULT_TARGET_UTIL);
-    const step = Math.max(0.01, cfg.scaleStepPct ?? DEFAULT_STEP_PCT);
+    const target = clamp01(knob(cfg.targetUtil, DEFAULT_TARGET_UTIL));
+    const step = Math.max(0.01, knob(cfg.scaleStepPct, DEFAULT_STEP_PCT));
     // An instance count is integral, so a step must move at least one machine:
     // a small percentage of a small fleet would otherwise round to a permanent
     // no-op and the controller would silently do nothing forever.
@@ -300,7 +318,7 @@ const autoscaler: ComponentBehaviour = {
       return;
     }
 
-    const warmup = Math.max(0, cfg.warmupMs ?? DEFAULT_WARMUP_MS);
+    const warmup = Math.max(0, knob(cfg.warmupMs, DEFAULT_WARMUP_MS));
     if (warmup === 0) {
       st.targetInstances = want;
       ctx.setScale(watched, want);
@@ -338,12 +356,12 @@ const autoscaler: ComponentBehaviour = {
     stats.pendingInstances = scaling ? Math.max(0, wanted - live) : 0;
     stats.scaling = scaling;
     stats.watchedUtil = st.watchedId ? (ctx.utilizationOf(st.watchedId) ?? 0) : 0;
-    stats.setpoint = clamp01(state.config.targetUtil ?? DEFAULT_TARGET_UTIL);
+    stats.setpoint = clamp01(knob(state.config.targetUtil, DEFAULT_TARGET_UTIL));
 
     // Which of the three waits it is in, and how much of it is left. Resolved
     // in the same order onTick() applies them, so the label never claims the
     // controller is free to act when the next tick will find it blocked.
-    const cooldown = Math.max(0, state.config.cooldownMs ?? DEFAULT_COOLDOWN_MS);
+    const cooldown = Math.max(0, knob(state.config.cooldownMs, DEFAULT_COOLDOWN_MS));
     if (scaling) {
       stats.scalePhase = 'warming';
       stats.phaseRemainingMs = Math.max(0, st.warmupDueMs - ctx.now);
@@ -394,8 +412,28 @@ function asRegion(state: NodeStateLike): RegionState | null {
 
 /** How many of this node's out edges count as regions. */
 function regionCount(state: NodeStateLike): number {
-  const declared = Math.floor(state.config.regions ?? state.out.length);
-  return Math.max(1, Math.min(declared, state.out.length));
+  const declared = state.config.regions;
+  // NaN fails every comparison, so `Math.min` and `Math.max` hand it back
+  // unchanged. It is then published as the region total, while the census
+  // loop that counts healthy regions runs zero times -- and the readout is
+  // meant to be derived from the very predicate the routing uses.
+  if (!Number.isFinite(declared)) return state.out.length;
+  return Math.max(1, Math.min(Math.floor(declared as number), state.out.length));
+}
+
+/**
+ * The region the student asked for, clamped into the regions that exist.
+ *
+ * A value that is not a finite number is the first region rather than
+ * itself: `Math.floor(NaN)` is NaN, every comparison below is false for it,
+ * so it used to be adopted as the live region -- and `out[NaN]` is nothing,
+ * which makes the switch route nowhere at all.
+ */
+function configuredRegion(state: NodeStateLike, count: number): number {
+  const raw = state.config.activeRegion;
+  if (!Number.isFinite(raw)) return 0;
+  const configured = Math.floor(raw as number);
+  return configured < 0 ? 0 : configured >= count ? count - 1 : configured;
 }
 
 /**
@@ -434,7 +472,7 @@ function regionHealthy(ctx: BehaviourCtx, state: NodeStateLike, i: number): bool
  */
 const region: ComponentBehaviour = {
   kind: 'region',
-  // A pure switch, like an lb: it forwards without holding slots of its own.
+  // A pure switch: it forwards without holding slots of its own.
   servesRequests: true,
   generatesLoad: false,
   pullsFromQueues: false,
@@ -476,8 +514,7 @@ const region: ComponentBehaviour = {
     // between it and the live region -- after a failover the two differ by
     // design, and treating that as a manual switch would drag traffic back
     // onto the region that just died.
-    const configured = Math.floor(cfg.activeRegion ?? 0);
-    const wanted = configured < 0 ? 0 : configured >= count ? count - 1 : configured;
+    const wanted = configuredRegion(state, count);
     if (st.active === -1 || wanted !== st.lastConfigured) {
       st.lastConfigured = wanted;
       st.active = wanted;
@@ -606,8 +643,7 @@ function liveRegionIndex(
   const active = st.failoverDueMs >= 0 ? st.failoverTarget : st.active;
   if (active < 0) {
     // Nothing has been adopted yet; pickEdge would take the configured region.
-    const configured = Math.floor(state.config.activeRegion ?? 0);
-    const wanted = configured < 0 ? 0 : configured >= count ? count - 1 : configured;
+    const wanted = configuredRegion(state, count);
     return regionHealthy(ctx, state, wanted) ? wanted : -1;
   }
 

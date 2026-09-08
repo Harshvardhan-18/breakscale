@@ -31,6 +31,15 @@ const MAX_DELTA_MS = 100;
 const MAX_EVENTS_PER_ADVANCE = 60000;
 /** Hop-depth ceiling; deeper resolves as FailureReason 'depth'. */
 const MAX_HOP_DEPTH = 32;
+/**
+ * Instance-count ceiling, matching the inspector's own slider.
+ *
+ * The engine writes one array element per instance on every snapshot, so an
+ * unbounded count is an unbounded allocation. A design does not only come from
+ * the editor: a shared link, a `.breakscale` file and a restored session all
+ * carry `instances` straight through, and `isTopology` does not police it.
+ */
+const MAX_INSTANCES = 512;
 /** Trailing window for latency percentiles. */
 const LATENCY_WINDOW_MS = 5000;
 /** Capacity of each latency ring buffer. */
@@ -573,6 +582,13 @@ export class Engine implements BehaviourCtx {
   private authoredCapacity = new Map<string, number>();
   /** Same, for the per-shard knob a sharded store is scaled through. */
   private authoredShardCapacity = new Map<string, number>();
+  /**
+   * Same, for the instance count a plain service is scaled through. `instances`
+   * is optional in NodeConfig, so an entry can be `undefined`: that records
+   * "the preset left it unset", and reset() has to put the field back to unset
+   * rather than skip it, because a scale-up will have written a number there.
+   */
+  private authoredInstances = new Map<string, number | undefined>();
 
   constructor(topology: Topology, seed = 1) {
     this.seed = seed >>> 0;
@@ -583,20 +599,38 @@ export class Engine implements BehaviourCtx {
   }
 
   /**
-   * Snapshot the authored capacity of every node, for reset() to restore.
+   * Snapshot the authored scale of every node, for reset() to restore.
    *
-   * Both scalable knobs are recorded, because a controller may write either
-   * one depending on the target kind's `capacityField`. Restoring only
-   * `capacity` would let a controller-scaled sharded store carry its grown
-   * `shardCapacity` across a reset, so the same seed would not replay.
+   * All three scalable knobs are recorded, because a controller may write any
+   * one depending on the target kind's `scaleField`. Restoring only `capacity`
+   * would let a controller-scaled sharded store carry its grown `shardCapacity`
+   * across a reset, or an autoscaled service its grown `instances`, so the same
+   * seed would not replay.
    */
   private recordAuthoredCapacity(): void {
     this.authoredCapacity.clear();
     this.authoredShardCapacity.clear();
+    this.authoredInstances.clear();
     for (const n of this.topology.nodes) {
       this.authoredCapacity.set(n.id, n.config.capacity);
       this.authoredShardCapacity.set(n.id, n.config.shardCapacity);
+      this.authoredInstances.set(n.id, n.config.instances);
     }
+  }
+
+  /**
+   * The authored value of whichever knob a kind scales along, or undefined when
+   * the preset left it unset. The hot-swap preserve rule in buildNodes() reads
+   * this to tell a controller write (which moves state.config but not the
+   * authored map) from a student edit (which moves both).
+   */
+  private authoredScale(
+    nodeId: string,
+    field: 'instances' | 'shardCapacity',
+  ): number | undefined {
+    return field === 'shardCapacity'
+      ? this.authoredShardCapacity.get(nodeId)
+      : this.authoredInstances.get(nodeId);
   }
 
   /* ---------------- public API ---------------- */
@@ -618,15 +652,19 @@ export class Engine implements BehaviourCtx {
   updateNodeConfig(id: string, patch: Partial<NodeConfig>): void {
     const node = this.topology.nodes.find((n) => n.id === id);
     if (node) Object.assign(node.config, patch);
-    // A capacity the student typed is a new authored value, so reset() should
-    // return to it rather than to the one the preset shipped with. A capacity
-    // written by a controller goes through setCapacity() and deliberately does
-    // NOT land here.
+    // A scale value the student typed is a new authored value, so reset() should
+    // return to it rather than to the one the preset shipped with, and a later
+    // hot swap should treat it as authored, not as a controller write. A value
+    // written by a controller goes through setScale() and deliberately does NOT
+    // land here.
     if (patch.capacity !== undefined) {
       this.authoredCapacity.set(id, Math.max(1, Math.floor(patch.capacity)));
     }
     if (patch.shardCapacity !== undefined) {
       this.authoredShardCapacity.set(id, Math.max(1, Math.floor(patch.shardCapacity)));
+    }
+    if (patch.instances !== undefined) {
+      this.authoredInstances.set(id, Math.max(1, Math.floor(patch.instances)));
     }
     const state = this.nodes.get(id);
     if (!state) return;
@@ -804,7 +842,13 @@ export class Engine implements BehaviourCtx {
       const timeoutRate = state.timeouts.rate(now);
       const hits = state.hits.rate(now);
       const misses = state.misses.rate(now);
-      const resolved = completions + errorsPerSec + shedRate;
+      /*
+       * Timeouts belong in both halves. They were in neither, so `errorRate`
+       * answered "how many of the requests that did not time out went wrong"
+       * while the cell rendering it says "failing", and a caller losing a
+       * quarter of its traffic to a slow dependency read 0%.
+       */
+      const resolved = completions + errorsPerSec + shedRate + timeoutRate;
 
       // A fresh object per snapshot, deliberately. Mutating a reused entry in
       // place makes every memoised consumer see an unchanged reference and
@@ -842,7 +886,8 @@ export class Engine implements BehaviourCtx {
       entry.p50 = this.nodePctScratch[0];
       entry.p95 = this.nodePctScratch[1];
       entry.p99 = this.nodePctScratch[2];
-      entry.errorRate = resolved > 0 ? (errorsPerSec + shedRate) / resolved : 0;
+      entry.errorRate =
+        resolved > 0 ? (errorsPerSec + shedRate + timeoutRate) / resolved : 0;
       entry.shedRate = shedRate;
       entry.timeoutRate = timeoutRate;
       entry.hitRate = hits + misses > 0 ? hits / (hits + misses) : 0;
@@ -1054,6 +1099,12 @@ export class Engine implements BehaviourCtx {
       if (authored !== undefined) n.config.capacity = authored;
       const authoredShard = this.authoredShardCapacity.get(n.id);
       if (authoredShard !== undefined) n.config.shardCapacity = authoredShard;
+      // `instances` is optional, so an authored value of undefined is a real
+      // state to restore to, not a missing entry: a scale-up wrote a number
+      // here, and leaving it would replay the run from the grown fleet.
+      if (this.authoredInstances.has(n.id)) {
+        n.config.instances = this.authoredInstances.get(n.id);
+      }
     }
     this.buildNodes(null);
   }
@@ -1071,7 +1122,25 @@ export class Engine implements BehaviourCtx {
       if (kept && kept.kind === node.kind) {
         // Preserve in-flight work across a hot swap.
         state = kept;
+        // A controller (the autoscaler) writes its scale decision into
+        // state.config[scaleField] and into this.topology, but never into the
+        // authored map. `node.config` here is the shell topology's, which still
+        // carries the authored value, so `{ ...node.config }` would revert a
+        // live autoscaled fleet and leave the controller's target pointing at a
+        // size the node no longer has. Keep the live value whenever it diverges
+        // from authored. A student edit cannot be mistaken for a controller
+        // write: updateNodeConfig moves node.config, the authored map and
+        // state.config together, so it shows no divergence and flows through.
+        const field = state.behaviour.scaleField;
+        const liveScale =
+          field !== undefined &&
+          state.config[field] !== this.authoredScale(node.id, field)
+            ? state.config[field]
+            : undefined;
         state.config = { ...node.config };
+        if (field !== undefined && liveScale !== undefined) {
+          state.config[field] = liveScale;
+        }
         state.out = [];
         state.ctrl = [];
         state.sources = [];
@@ -1662,7 +1731,7 @@ export class Engine implements BehaviourCtx {
     }
   }
 
-  /** lb / client style pass-through with a tiny (possibly zero) service time. */
+  /** Client-style pass-through with a tiny (possibly zero) service time. */
   private beginZeroService(state: NodeState, req: Req): void {
     const ms = this.serviceTimeFor(state);
     req.ownMs = ms;
@@ -1861,8 +1930,14 @@ export class Engine implements BehaviourCtx {
     const parent = call.parent;
     const callerState = parent ? this.nodes.get(parent.nodeId) : null;
     if (callerState) {
+      // Giving up is what this counter means, so it belongs here and only
+      // here: this is the node whose deadline elapsed.
       callerState.timeouts.add(this.now, 1);
-      callerState.totalFailed++;
+      // The failure itself is NOT booked here. Every node already has one
+      // path that books it when the request ends there: `resolve` for the
+      // root client, and the fan-out join for everything below it, both of
+      // which fire for every reason rather than only this one. Booking it
+      // here as well is what made a node fail more often than the system did.
     }
 
     // Detach the call from its parent so its eventual completion is discarded,
@@ -1939,9 +2014,12 @@ export class Engine implements BehaviourCtx {
         this.failures[reason]++;
         if (client) {
           client.totalFailed++;
-          if (reason === 'timeout') client.timeouts.add(this.now, 1);
-          else if (reason === 'shed') client.sheds.add(this.now, 1);
-          else client.errors.add(this.now, 1);
+          // No timeout arm. `onTimeout` already attributed it to whichever
+          // node gave up, which is this client when it called its dependency
+          // directly and some node below it otherwise. Counting it again here
+          // is what made a client's timeout rate outrun the load it offered.
+          if (reason === 'shed') client.sheds.add(this.now, 1);
+          else if (reason !== 'timeout') client.errors.add(this.now, 1);
         }
       }
       this.recycle(req);
@@ -2149,7 +2227,10 @@ export class Engine implements BehaviourCtx {
    */
   effectiveInstances(state: NodeStateLike): number {
     const raw = state.config.instances;
-    return raw === undefined ? 1 : Math.max(1, Math.floor(raw));
+    // `Math.max(1, Math.floor(NaN))` is NaN, so the ">= 1" above was a promise
+    // this could not keep, and `units.length = NaN` throws where it is read.
+    if (raw === undefined || !Number.isFinite(raw)) return 1;
+    return Math.min(MAX_INSTANCES, Math.max(1, Math.floor(raw)));
   }
 
   countHit(state: NodeStateLike): void {
