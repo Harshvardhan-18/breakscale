@@ -99,6 +99,8 @@ const EV_WORKER_POLL = 3;
 const EV_RETRY = 4;
 /** A request finished traversing an edge with a latencyMs and is now offered. */
 const EV_LINK_ARRIVE = 5;
+/** A timer owned by a behaviour for a request it held at admission. */
+const EV_BEHAVIOUR_WAKE = 6;
 
 interface Ev extends Timed {
   time: number;
@@ -542,6 +544,7 @@ export class Engine implements BehaviourCtx {
     'conn-refused': 0,
     unauthorized: 0,
     'bulkhead-full': 0,
+    'acquire-timeout': 0,
     deprioritized: 0,
   };
 
@@ -1070,6 +1073,7 @@ export class Engine implements BehaviourCtx {
       'conn-refused': 0,
       unauthorized: 0,
       'bulkhead-full': 0,
+      'acquire-timeout': 0,
       deprioritized: 0,
     };
     this.history = [];
@@ -1269,6 +1273,11 @@ export class Engine implements BehaviourCtx {
           this.admit(state, ev.req);
         }
         break;
+      case EV_BEHAVIOUR_WAKE:
+        if (ev.req && ev.req.token === ev.token && !ev.req.resolved) {
+          state.behaviour.onWake?.(this, state, ev.req);
+        }
+        break;
       default:
         break;
     }
@@ -1295,7 +1304,31 @@ export class Engine implements BehaviourCtx {
   private onClientArrival(state: NodeState): void {
     this.scheduleArrival(state.id);
     if (this.effectiveRps(state) <= 0) return;
-    if (this.liveRequests >= MAX_LIVE_REQUESTS) return;
+
+    /*
+     * Past the live-request ceiling the request is still OFFERED, and
+     * saying so is the whole point. Returning silently here left every
+     * rate reading zero while the design was maximally overloaded: a
+     * client sending a million a second reported "offered 0.0/s, served
+     * 0.0/s, 0.0% failed" beside a service pinned at 100% busy, which
+     * reads as an idle system rather than a drowning one.
+     *
+     * So it is counted and then shed. The ceiling is this engine
+     * protecting itself rather than anything the design did, but a
+     * request the system could not take IS a shed from the reader's
+     * side, and the alternative is a meter that lies at exactly the
+     * moment it matters most.
+     */
+    if (this.liveRequests >= MAX_LIVE_REQUESTS) {
+      this.totalRequests++;
+      this.sysOffered.add(this.now, 1);
+      state.arrivals.add(this.now, 1);
+      state.sheds.add(this.now, 1);
+      state.totalFailed++;
+      this.failures.shed++;
+      this.sysFailed.add(this.now, 1);
+      return;
+    }
 
     const root = this.acquireReq();
     root.nodeId = state.id;
@@ -2256,6 +2289,26 @@ export class Engine implements BehaviourCtx {
     state.errors.add(this.now, 1);
     state.totalFailed++;
     this.resolve(req as Req, false, reason, 0);
+  }
+
+  resumeAdmission(stateLike: NodeStateLike, reqLike: ReqLike): void {
+    const state = stateLike as NodeState;
+    const req = reqLike as Req;
+    if (req.resolved) return;
+    req.ownMs = 0;
+    this.beginZeroService(state, req);
+  }
+
+  wakeAfter(stateLike: NodeStateLike, reqLike: ReqLike, delayMs: number): void {
+    const state = stateLike as NodeState;
+    const req = reqLike as Req;
+    this.push(
+      this.now + Math.max(0, delayMs),
+      EV_BEHAVIOUR_WAKE,
+      state.id,
+      req,
+      req.token,
+    );
   }
 
   countCustom(stateLike: NodeStateLike, name: string, n: number): void {

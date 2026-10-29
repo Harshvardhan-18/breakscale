@@ -438,6 +438,12 @@ export interface NodeConfig {
    * bounded instead of letting it grow without limit.
    */
   bulkheadMax?: number;
+  /** Bulkhead only: reject immediately, or wait for a pool slot to open. */
+  bulkheadMode?: BulkheadMode;
+  /** Bulkhead only: waiting acquire requests allowed before shedding. */
+  acquireQueueMax?: number;
+  /** Bulkhead only: longest a request may wait to acquire a pool slot, in ms. */
+  acquireTimeoutMs?: number;
 
   /* ---- retryqueue: retried delivery with a dead letter shelf --------- *
    * Reuses the shared knobs: `capacity` is delivery concurrency,
@@ -1071,6 +1077,12 @@ export interface NodeStats {
   bulkheadLimit?: number;
   /** Bulkhead only: requests per second refused because the pool was full. */
   bulkheadRejectedRate?: number;
+  /** Bulkhead only: requests currently waiting to acquire a pool slot. */
+  bulkheadWaiting?: number;
+  /** Bulkhead only: most recent measured wait before acquiring a pool slot. */
+  bulkheadAcquireLatencyMs?: number;
+  /** Bulkhead only: acquire attempts per second that reached their deadline. */
+  bulkheadAcquireTimeoutRate?: number;
 
   /* ---- retryqueue readouts --------------------------------------------- */
 
@@ -1228,6 +1240,24 @@ export const TRAFFIC_PATTERNS: readonly TrafficPattern[] = [
 ];
 
 /**
+ * How a bulkhead answers a request it has no free slot for.
+ *
+ * `reject` fails it there and then, which is what a bulkhead has always
+ * done. `wait` holds it until a slot frees or the acquire timeout fires,
+ * which is how a client connection pool behaves and is the whole point of
+ * modelling one.
+ */
+export type BulkheadMode = 'reject' | 'wait';
+
+/**
+ * The same list at runtime, for the validators that cannot read a type.
+ * Written out beside the type rather than derived from it, for the reason
+ * TRAFFIC_PATTERNS is: a union and an array cannot be generated from one
+ * another in TypeScript, so the pairing is checked by a test instead.
+ */
+export const BULKHEAD_MODES: readonly BulkheadMode[] = ['reject', 'wait'];
+
+/**
  * Seconds for one cycle when a client does not say.
  *
  * 60 is chosen so a reader watching in real time sees a whole cycle without
@@ -1257,6 +1287,8 @@ export type FailureReason =
   | 'unauthorized'
   /** Refused by a bulkhead: its concurrency pool was already full. */
   | 'bulkhead-full'
+  /** A bulkhead waiter exceeded its acquire deadline before a slot opened. */
+  | 'acquire-timeout'
   /** Dropped by a load shedder protecting higher-priority traffic. */
   | 'deprioritized';
 

@@ -269,6 +269,22 @@
   text-wrap: pretty;
 }
 
+/* Stacks state-dependent hints in one cell so the reserved height follows
+   the tallest message at whatever width the panel has, instead of a fixed
+   min-height that only fits one width. `visibility` (not `display`) keeps the
+   hidden ones in layout and drops them from the accessibility tree. */
+.ins-hint-stack {
+  display: grid;
+}
+
+.ins-hint-stack > .ins-hint {
+  grid-area: 1 / 1;
+}
+
+.ins-hint-stack > [data-active='false'] {
+  visibility: hidden;
+}
+
 .ins-field-row .row-k {
   min-width: 0;
   font-size: var(--fs-sm);
@@ -363,6 +379,16 @@
   line-height: var(--lh-sm);
   letter-spacing: 0;
   color: var(--text-faint);
+}
+
+/* One suggestion for what to do about a bottleneck, not a formula -- the
+   same teaching prose as .ins-blurb, not the quiet mono of .ins-expr. */
+.ins-suggestion {
+  padding: var(--sp-1) 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-prose);
+  color: var(--text-dim);
+  text-wrap: pretty;
 }
 
 /* --------------------------------------------------------------------------

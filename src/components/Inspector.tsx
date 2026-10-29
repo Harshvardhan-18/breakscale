@@ -1,4 +1,4 @@
-import { useCallback, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 /*
  * Transport glyphs. The top-level entry, not the per-icon deep paths the
@@ -15,6 +15,7 @@ import type {
   SystemStats,
 } from '../sim/types';
 import { defaultConfig } from '../sim/presets';
+import { suggestionFor } from '../content/suggestions';
 import { KIND_NAME, KIND_TERM } from './nodeVisuals';
 import {
   NA,
@@ -95,6 +96,9 @@ type Field =
   | 'intervalMs'
   | 'batchSize'
   | 'bulkheadMax'
+  | 'bulkheadMode'
+  | 'acquireQueueMax'
+  | 'acquireTimeoutMs'
   | 'flushDelayMs'
   | 'edgeShare'
   | 'lowPriorityShare'
@@ -287,7 +291,7 @@ const FIELDS_BY_KIND: Record<NodeKind, Field[]> = {
   // One knob, and it IS the component: how many calls may be outstanding
   // to the dependency behind it. errorRate and retries are deliberately
   // not offered here; both would make the pool count drift.
-  bulkhead: ['bulkheadMax'],
+  bulkhead: ['bulkheadMax', 'bulkheadMode', 'acquireQueueMax', 'acquireTimeoutMs'],
   // Delivery concurrency, dispatch cost, buffer depth, and the redrive
   // policy: attempts and the per-attempt deadline.
   retryqueue: [
@@ -372,7 +376,7 @@ const KIND_BLURB: Record<NodeKind, string> = {
   service:
     'The workhorse. How many it handles at once, divided by how long each takes, is the ceiling everything else queues behind.',
   cache:
-    'Answers hits without touching downstream. The hit rate is the knob that matters here.',
+    'Answers hits without touching downstream. Each cache rolls its own hit chance, independently of the others, so stacking them multiplies misses rather than treating later caches as filters on earlier misses.',
   db: 'Slots and service time. It does not retry for you, so its queue is where pressure shows.',
   queue:
     'A buffer. Depth is the whole story: it absorbs bursts up to the limit, then sheds.',
@@ -386,7 +390,7 @@ const KIND_BLURB: Record<NodeKind, string> = {
     'Watches one node and adds capacity when it runs hot. New capacity takes warmup time to arrive, so load always leads it.',
   region:
     'Sends traffic to one region at a time. If that region dies, failover costs you a full outage window before the next one takes over.',
-  cdn: 'An edge cache in front of everything. At a 0.9 hit rate your origin sees a tenth of the traffic. It is the cheapest capacity you will ever add.',
+  cdn: 'An edge cache in front of everything. At a 0.9 hit rate one CDN leaves a tenth of the traffic for the origin, and that chance is rolled independently of every other cache on the path. It is still the cheapest capacity you will ever add.',
   ratelimiter:
     'A token bucket. Refuses excess traffic instantly instead of queueing it, which is what stops a busy system turning into a dead one.',
   breaker:
@@ -495,7 +499,15 @@ interface NumberSpec {
   step: number;
 }
 
-type FieldSpec = SliderSpec | NumberSpec;
+interface ChoiceSpec {
+  control: 'choice';
+  label: string;
+  unit: string;
+  hint?: FieldHint;
+  options: readonly { value: 'reject' | 'wait'; label: string }[];
+}
+
+type FieldSpec = SliderSpec | NumberSpec | ChoiceSpec;
 
 const FIELD_SPECS: Record<Field, FieldSpec> = {
   rps: {
@@ -562,6 +574,7 @@ const FIELD_SPECS: Record<Field, FieldSpec> = {
     term: 'hit-rate',
     label: 'Hit rate you set',
     unit: 'percent',
+    hint: 'Each cache or CDN rolls this chance on its own. Two at 80% leave about 4% of traffic for whatever is behind them, because the chances multiply.',
     min: 0,
     max: 1,
     step: 0.01,
@@ -971,6 +984,33 @@ const FIELD_SPECS: Record<Field, FieldSpec> = {
     max: 512,
     step: 1,
   },
+  bulkheadMode: {
+    control: 'choice',
+    label: 'When the pool is full',
+    unit: 'admission behavior',
+    hint: 'Reject fails immediately. Wait holds a request until a connection opens, or its acquire timeout expires.',
+    options: [
+      { value: 'reject', label: 'Reject' },
+      { value: 'wait', label: 'Wait' },
+    ],
+  },
+  acquireQueueMax: {
+    control: 'number',
+    label: 'Waiting acquires, at most',
+    unit: 'requests',
+    min: 0,
+    max: 10000,
+    step: 1,
+  },
+  acquireTimeoutMs: {
+    control: 'slider',
+    label: 'Acquire timeout',
+    unit: 'milliseconds',
+    min: 0,
+    max: 30000,
+    step: 50,
+    display: (v) => formatMs(v),
+  },
   flushDelayMs: {
     control: 'slider',
     term: 'dirty-write',
@@ -1172,6 +1212,9 @@ const FIELD_GROUPS: { title: string; fields: ReadonlySet<Field> }[] = [
       'intervalMs',
       'batchSize',
       'bulkheadMax',
+      'bulkheadMode',
+      'acquireQueueMax',
+      'acquireTimeoutMs',
       'flushDelayMs',
       'edgeShare',
       'lowPriorityShare',
@@ -1362,6 +1405,41 @@ function NumberRow({
   );
 }
 
+function ChoiceRow({
+  spec,
+  value,
+  locked,
+  onChange,
+}: {
+  spec: ChoiceSpec;
+  value: 'reject' | 'wait';
+  locked?: boolean;
+  onChange: (v: 'reject' | 'wait') => void;
+}) {
+  const id = useId();
+  return (
+    <div className={locked ? 'ins-field-row is-locked' : 'ins-field-row'}>
+      <label className="row-k" htmlFor={id}>
+        {spec.label}
+      </label>
+      <select
+        id={id}
+        className="ins-number"
+        value={value}
+        disabled={locked}
+        onChange={(e) => onChange(e.currentTarget.value as 'reject' | 'wait')}
+      >
+        {spec.options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      {spec.hint ? <p className="ins-hint">{spec.hint}</p> : null}
+    </div>
+  );
+}
+
 /**
  * One live readout. `tone` is a health class or undefined — at 'ok' the value
  * stays neutral, so a healthy panel carries no colour at all and --warn /
@@ -1510,7 +1588,8 @@ function VitalsMeter({
       const used = stats.bulkheadInFlight ?? 0;
       const fill = limit > 0 ? Math.min(1, used / limit) : 0;
       const rejecting = (stats.bulkheadRejectedRate ?? 0) > 0;
-      const tone = rejecting ? 'is-danger' : toneClass(healthOfLoad(fill));
+      const timingOut = (stats.bulkheadAcquireTimeoutRate ?? 0) > 0;
+      const tone = rejecting || timingOut ? 'is-danger' : toneClass(healthOfLoad(fill));
       return (
         <div className="ins-util">
           <div className="ins-util-head">
@@ -1657,7 +1736,15 @@ function RegionPanel({ stats }: { stats: NodeStats }) {
  * NOTHING breaker-specific while the node was failing fast at 93 rps.
  * A row appears only for the kinds it applies to.
  */
-function KindStatRows({ kind, stats }: { kind: NodeKind; stats: NodeStats }) {
+function KindStatRows({
+  kind,
+  config,
+  stats,
+}: {
+  kind: NodeKind;
+  config: NodeConfig;
+  stats: NodeStats;
+}) {
   switch (kind) {
     case 'cache':
       return (
@@ -1974,6 +2061,29 @@ function KindStatRows({ kind, stats }: { kind: NodeKind; stats: NodeStats }) {
             value={formatRate(stats.bulkheadRejectedRate)}
             tone={(stats.bulkheadRejectedRate ?? 0) > 0 ? 'is-danger' : undefined}
           />
+          {config.bulkheadMode === 'wait' && (
+            <>
+              <StatRow
+                label="Waiting to acquire"
+                value={formatCount(stats.bulkheadWaiting ?? 0)}
+              />
+              <StatRow
+                label="Last acquire wait, measured"
+                value={
+                  stats.bulkheadAcquireLatencyMs === undefined
+                    ? NA
+                    : formatMs(stats.bulkheadAcquireLatencyMs)
+                }
+              />
+              <StatRow
+                label="Acquire timeouts"
+                value={formatRate(stats.bulkheadAcquireTimeoutRate)}
+                tone={
+                  (stats.bulkheadAcquireTimeoutRate ?? 0) > 0 ? 'is-danger' : undefined
+                }
+              />
+            </>
+          )}
         </>
       );
 
@@ -2337,6 +2447,134 @@ function AutoscalerPanel({ stats }: { stats: NodeStats }) {
 }
 
 /**
+ * How long a calmer state must hold before a hint reflecting a worse one
+ * changes. Long enough to ride out a signal that flips on every 10Hz
+ * snapshot, short enough that a hint does not outstay what it describes.
+ */
+const HINT_HOLD_MS = 1500;
+
+/**
+ * `on`, but turning off only after it has stayed off for HINT_HOLD_MS.
+ *
+ * For a hint that appears when a noisy signal crosses a line: it shows the
+ * moment the signal does, and does not blink out each time the signal dips
+ * back for a single snapshot.
+ */
+function useLingering(on: boolean): boolean {
+  const [held, setHeld] = useState(on);
+  // Turning on takes effect during render, so it shows this pass.
+  if (on && !held) setHeld(true);
+  useEffect(() => {
+    if (on) return;
+    const t = setTimeout(() => setHeld(false), HINT_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [on]);
+  return on || held;
+}
+
+type QueueHintState = 'idle' | 'queued' | 'shedding';
+
+const QUEUE_HINT_RANK: Record<QueueHintState, number> = {
+  idle: 0,
+  queued: 1,
+  shedding: 2,
+};
+
+/**
+ * The queue hint state, escalating at once but calming only reluctantly.
+ *
+ * A queue whose consumers roughly match its producers flips between 0 and 1
+ * waiting item on every 10Hz snapshot, and a full one flips in and out of
+ * shedding the same way. Following that directly makes the hint flicker. A
+ * worse state shows immediately; a better one waits until it has held for a
+ * continuous HINT_HOLD_MS. The shed rate is held with the state so a
+ * lingering "turning away" message keeps the last real rate instead of 0/s.
+ */
+function useQueueHint(
+  state: QueueHintState,
+  shedRate: number,
+): { state: QueueHintState; shedRate: number } {
+  const [held, setHeld] = useState({ state, shedRate });
+  const escalating = QUEUE_HINT_RANK[state] >= QUEUE_HINT_RANK[held.state];
+
+  // A same-or-worse state takes over during render, so it shows this pass
+  // and the rate stays live; React re-runs the render before committing.
+  if (escalating && (held.state !== state || held.shedRate !== shedRate)) {
+    setHeld({ state, shedRate });
+  }
+
+  // A calmer state only lands after holding for HINT_HOLD_MS. The
+  // timer restarts only when the target state changes, not on a new rate.
+  useEffect(() => {
+    if (escalating) return;
+    const t = setTimeout(() => setHeld({ state, shedRate: 0 }), HINT_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [escalating, state]);
+
+  return escalating ? { state, shedRate } : held;
+}
+
+/**
+ * The replica set's split between the primary and the read pool.
+ *
+ * Both of its signals are noisy: stale reads come and go with every lagging
+ * read, and the primary hovers around the bottleneck threshold. So nothing
+ * here is added or removed as they change. The stale-read row always shows
+ * (0% is a real reading), and the two hints share one slot sized to the
+ * taller of them, like the queue hint. When both apply, the bottleneck
+ * warning wins: the stale share is still on the row above it.
+ */
+function ReplicaSetSection({ per, stats }: { per: number[]; stats: NodeStats }) {
+  // Index 0 is the primary and reports the WRITE pool; the rest share the
+  // read pool. Averaging them together is what hides a write bottleneck.
+  const primary = per[0] ?? 0;
+  const reads = per.slice(1);
+  const readAvg = reads.length ? reads.reduce((a, b) => a + b, 0) / reads.length : 0;
+  // Lingering keeps the slot from flicking between messages, not just from
+  // moving: a hint swaps only after its signal has settled.
+  const writeBound = useLingering(primary - readAvg > 0.4);
+  const stale = useLingering(stats.staleReadRate > 0);
+  const hint = writeBound ? 'write-bound' : stale ? 'stale' : null;
+  return (
+    <Section title="Across the set">
+      <div className="ins-stats">
+        <StatRow
+          label="Primary (writes)"
+          value={formatPct(primary)}
+          tone={toneClass(healthOfLoad(primary))}
+        />
+        <StatRow
+          label="Read replicas"
+          term="read-replica"
+          value={formatCount(reads.length)}
+        />
+        <StatRow
+          label="Read replicas, average"
+          value={formatPct(readAvg)}
+          tone={toneClass(healthOfLoad(readAvg))}
+        />
+        <StatRow
+          label="Reads served stale"
+          term="stale-read"
+          value={formatPct(stats.staleReadRate)}
+          tone={toneClass(healthOfErr(stats.staleReadRate))}
+        />
+      </div>
+      <div className="ins-hint-stack">
+        <p className="ins-hint is-warn" data-active={hint === 'write-bound'}>
+          The primary is the bottleneck, not the replicas. Adding more read replicas
+          will not help; every write still goes through the one primary.
+        </p>
+        <p className="ins-hint" data-active={hint === 'stale'}>
+          Some reads are answered by a replica that has not caught up with the latest
+          write yet. Lower the replication lag to reduce this.
+        </p>
+      </div>
+    </Section>
+  );
+}
+
+/**
  * Per-unit truth for the kinds that are genuinely several things.
  *
  * The headline is the SPREAD, not the mean, and for a shard that is the whole
@@ -2378,55 +2616,7 @@ function UnitsPanel({ node, stats }: { node: SimNode; stats: NodeStats }) {
     );
   }
 
-  if (node.kind === 'replica') {
-    // Index 0 is the primary and reports the WRITE pool; the rest share the
-    // read pool. Averaging them together is what hides a write bottleneck.
-    const primary = per[0] ?? 0;
-    const reads = per.slice(1);
-    const readAvg = reads.length ? reads.reduce((a, b) => a + b, 0) / reads.length : 0;
-    const writeBound = primary - readAvg > 0.4;
-    return (
-      <Section title="Across the set">
-        <div className="ins-stats">
-          <StatRow
-            label="Primary (writes)"
-            value={formatPct(primary)}
-            tone={toneClass(healthOfLoad(primary))}
-          />
-          <StatRow
-            label="Read replicas"
-            term="read-replica"
-            value={formatCount(reads.length)}
-          />
-          <StatRow
-            label="Read replicas, average"
-            value={formatPct(readAvg)}
-            tone={toneClass(healthOfLoad(readAvg))}
-          />
-          {stats.staleReadRate > 0 && (
-            <StatRow
-              label="Reads served stale"
-              term="stale-read"
-              value={formatPct(stats.staleReadRate)}
-              tone={toneClass(healthOfErr(stats.staleReadRate))}
-            />
-          )}
-        </div>
-        {writeBound && (
-          <p className="ins-hint is-warn">
-            The primary is the bottleneck, not the replicas. Adding more read replicas
-            will not help; every write still goes through the one primary.
-          </p>
-        )}
-        {stats.staleReadRate > 0 && (
-          <p className="ins-hint">
-            Some reads are answered by a replica that has not caught up with the latest
-            write yet. Lower the replication lag to reduce this.
-          </p>
-        )}
-      </Section>
-    );
-  }
+  if (node.kind === 'replica') return <ReplicaSetSection per={per} stats={stats} />;
 
   // service / worker / db / cache / lb / cdn: interchangeable machines.
   const booting = stats.instancesPending ?? 0;
@@ -2462,7 +2652,10 @@ function QueuePanel({ stats }: { stats: NodeStats }) {
   const limit = stats.queueLimit > 0 ? stats.queueLimit : 1;
   const depth = stats.queued;
   const fill = Math.min(1, depth / limit);
-  const shedding = stats.shedRate > 0;
+  const hint = useQueueHint(
+    stats.shedRate > 0 ? 'shedding' : depth > 0 ? 'queued' : 'idle',
+    stats.shedRate,
+  );
   return (
     <Section title="The line">
       <div className="ins-util">
@@ -2476,17 +2669,19 @@ function QueuePanel({ stats }: { stats: NodeStats }) {
         </div>
         <Meter value={fill} tone={toneClass(healthOfLoad(fill))} />
       </div>
-      {shedding ? (
-        <p className="ins-hint is-danger">
-          Full. It is turning away {formatRate(stats.shedRate)}. Work arriving now is
+      {/* Every message is rendered in one grid cell so the stack always holds
+          the tallest one's height at the current panel width. Only the active
+          message is visible; switching states never moves the panel below. */}
+      <div className="ins-hint-stack">
+        <p className="ins-hint is-danger" data-active={hint.state === 'shedding'}>
+          Full. It is turning away {formatRate(hint.shedRate)}. Work arriving now is
           being destroyed, not delayed. The consumers cannot keep up.
         </p>
-      ) : depth > 0 ? (
-        <p className="ins-hint">
+        <p className="ins-hint" data-active={hint.state === 'queued'}>
           Work is waiting here because the consumers are slower than the producers. It
           drains once they catch up.
         </p>
-      ) : null}
+      </div>
     </Section>
   );
 }
@@ -2539,6 +2734,12 @@ function SingleInspector({
   const arrivals = stats?.arrivalRate ?? 0;
   const headroom =
     showCeiling && arrivals > 0 && maxThroughput > 0 ? maxThroughput / arrivals : null;
+
+  // One suggestion, only once this node is actually the thing that cannot
+  // keep up -- below 1.0x headroom, same threshold the "Spare capacity"
+  // reading itself is toned by.
+  const suggestion =
+    headroom !== null && headroom < 1 ? suggestionFor(node.kind) : null;
 
   const serviceMsLabel =
     cfg.serviceMs < 10 ? cfg.serviceMs.toFixed(1) : String(Math.round(cfg.serviceMs));
@@ -2651,6 +2852,14 @@ function SingleInspector({
                     locked={locked}
                     onChange={(v) => onChange(node.id, { [field]: v })}
                   />
+                ) : spec.control === 'choice' ? (
+                  <ChoiceRow
+                    key={field}
+                    spec={spec}
+                    value={node.config.bulkheadMode ?? 'reject'}
+                    locked={locked}
+                    onChange={(v) => onChange(node.id, { bulkheadMode: v })}
+                  />
                 ) : (
                   <NumberRow
                     key={field}
@@ -2690,6 +2899,12 @@ function SingleInspector({
           </Section>
         )}
 
+        {suggestion && (
+          <Section title="Suggested fix">
+            <p className="ins-suggestion">{suggestion}</p>
+          </Section>
+        )}
+
         {/* Controllers (cron, autoscaler) serve nothing, ever: every generic
             row here is a hardwired zero for them, and ten rows of zeros are
             what made them read as broken. Their "What it is doing" panels
@@ -2724,7 +2939,7 @@ function SingleInspector({
                   term="offered"
                   value={formatRate(stats.arrivalRate)}
                 />
-                <KindStatRows kind={node.kind} stats={stats} />
+                <KindStatRows kind={node.kind} config={node.config} stats={stats} />
                 <StatRow
                   label="Typical request"
                   term="p50"
@@ -2942,6 +3157,13 @@ function MultiInspector({
                         value={value}
                         mixed={mixed}
                         onChange={(v) => applyAll({ [field]: v })}
+                      />
+                    ) : spec.control === 'choice' ? (
+                      <ChoiceRow
+                        key={field}
+                        spec={spec}
+                        value={nodes[0]!.config.bulkheadMode ?? 'reject'}
+                        onChange={(v) => applyAll({ bulkheadMode: v })}
                       />
                     ) : (
                       <NumberRow
